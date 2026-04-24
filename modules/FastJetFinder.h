@@ -31,8 +31,11 @@
 
 #include <vector>
 
-class TObjArray;
+#include "TObjArray.h"
+
 class TIterator;
+
+#include "fastjet/PseudoJet.hh"
 
 namespace fastjet
 {
@@ -154,6 +157,43 @@ private:
   TObjArray *fOutputArray; //!
   TObjArray *fRhoOutputArray; //!
   TObjArray *fConstituentsOutputArray; //!
+
+  // ---------------------------------------------------------------------------
+  // Dark-hadron visible-jet matching  (algorithm ID kDarkHadronVisibleMatch)
+  //
+  // Inputs (configured in the card):
+  //   InputArray         : visible final-state SM particles (from PdgCodeFilter)
+  //   DarkHadronJetArray : pre-clustered dark-hadron jets   (from FastJetFinder)
+  //   ParticleInputArray : full GenParticle collection      (from Delphes reader)
+  //
+  // For each dark-hadron jet the algorithm:
+  //   1. Collects the GenParticle indices of the jet's DH constituents.
+  //   2. BFS-traces every visible SM particle's ancestry (via M1/M2) to find
+  //      the owning DH jet.  Results are memoised per GenParticle index so
+  //      each node is visited at most once per event.
+  //   3. Builds one output PseudoJet per DH jet via fastjet::join(), so
+  //      jet.constituents() is populated for all post-clustering tools.
+  //      Output ordering mirrors fDarkHadronJetArray (NOT re-sorted by pT).
+  // ---------------------------------------------------------------------------
+
+  static const Int_t kDarkHadronVisibleMatch = 20;
+
+  /// Pre-clustered dark-hadron jets (already anti-kT clustered).
+  TObjArray *fDarkHadronJetArray;
+  TIterator *fItDarkHadronJetArray;
+
+  /// Full GenParticle collection for ancestry tracing.
+  TObjArray *fAllParticleArray;
+  TIterator *fItAllParticleArray;
+
+  /// Per-event working array: visible Candidates matched to jets,
+  /// stored in user_index order.  Owned by the factory (nodelete).
+  TObjArray fDHMatchedVisibleArray;
+
+  /// Core implementation: fills outputJets and matchedVisArray.
+  void BuildDarkHadronMatchedJets(
+    std::vector<fastjet::PseudoJet> &outputJets,
+    TObjArray                       &matchedVisArray);
 
   ClassDef(FastJetFinder, 1)
 };

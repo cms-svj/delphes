@@ -38,7 +38,6 @@
 #include "TFormula.h"
 #include "TLorentzVector.h"
 #include "TMath.h"
-#include "TObjArray.h"
 #include "TRandom3.h"
 #include "TString.h"
 
@@ -47,11 +46,13 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <queue>
 
 #include "fastjet/ClusterSequence.hh"
 #include "fastjet/ClusterSequenceArea.hh"
 #include "fastjet/JetDefinition.hh"
-#include "fastjet/PseudoJet.hh"
 #include "fastjet/Selector.hh"
 #include "fastjet/tools/JetMedianBackgroundEstimator.hh"
 
@@ -259,6 +260,24 @@ void FastJetFinder::Init()
     fDefinition = new JetDefinition(ee_kt_algorithm);
     break;
 
+  case kDarkHadronVisibleMatch:
+    // InputArray (inherited) = visible SM final-state particles
+    // DarkHadronJetArray     = pre-clustered DH jets
+    // ParticleInputArray     = full GenParticle collection
+
+    fDarkHadronJetArray =
+      ImportArray(GetString("DarkHadronJetArray", "FastJetFinderDH/jets"));
+    fItDarkHadronJetArray = fDarkHadronJetArray->MakeIterator();
+
+    fAllParticleArray =
+      ImportArray(GetString("ParticleInputArray", "Delphes/allParticles"));
+    fItAllParticleArray = fAllParticleArray->MakeIterator();
+
+    // fDHMatchedVisibleArray is a plain member (not a pointer); no ImportArray needed.
+    fDHMatchedVisibleArray.SetOwner(kFALSE); // Candidates owned by the factory
+
+    break;
+
   }
 
   fPlugin = plugin;
@@ -321,6 +340,221 @@ void FastJetFinder::Finish()
 
 //------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// File-scope helper: recursively collect all leaf Candidates from a
+// (possibly composite) Candidate.
+// For a standard single-level FastJetFinder jet, GetCandidates() already
+// returns the input particles directly; this helper handles the nested case.
+// ---------------------------------------------------------------------------
+static void CollectCandidateLeaves(Candidate *cand,
+                                   std::vector<Candidate *> &leaves)
+{
+  TObjArray *inner = cand->GetCandidates();
+  if(!inner || inner->GetEntriesFast() == 0)
+  {
+    leaves.push_back(cand);
+    return;
+  }
+  TIter it(inner);
+  Candidate *child;
+  while((child = static_cast<Candidate *>(it.Next())))
+    CollectCandidateLeaves(child, leaves);
+}
+
+// ---------------------------------------------------------------------------
+void FastJetFinder::BuildDarkHadronMatchedJets(
+    std::vector<fastjet::PseudoJet> &outputJets,
+    TObjArray                       &matchedVisArray)
+{
+  using namespace std;
+  using fastjet::PseudoJet;
+
+  outputJets.clear();
+  matchedVisArray.Clear("nodelete"); // Candidates are owned by the factory
+
+  const Int_t nAll     = fAllParticleArray->GetEntriesFast();
+  const Int_t nDHJets  = fDarkHadronJetArray->GetEntriesFast();
+  const Int_t nVisible = fInputArray->GetEntriesFast();
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Step 1 – Build Candidate-pointer → GenParticle-index map.
+  //
+  // PdgCodeFilter (and other Delphes filter modules) passes through the
+  // *same* Candidate pointers that live in the original GenParticle array.
+  // Therefore a pointer comparison is a reliable identity test.
+  // ──────────────────────────────────────────────────────────────────────────
+  unordered_map<const Candidate *, Int_t> ptrToGenIdx;
+  ptrToGenIdx.reserve(static_cast<size_t>(nAll) * 2);
+  for(Int_t i = 0; i < nAll; ++i)
+  {
+    ptrToGenIdx[static_cast<const Candidate *>(fAllParticleArray->At(i))] = i;
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Step 2 – For every DH-jet constituent, record its GenParticle index and
+  //           which jet it belongs to.
+  //
+  // We flatten composite jet Candidates to the leaves (the actual input
+  // GenParticles) before performing the lookup.
+  // ──────────────────────────────────────────────────────────────────────────
+  unordered_map<Int_t, Int_t> genIdxToJetIdx; // GenParticle idx → DH-jet idx
+  genIdxToJetIdx.reserve(static_cast<size_t>(nDHJets) * 8);
+
+  for(Int_t ji = 0; ji < nDHJets; ++ji)
+  {
+    Candidate *dhJet = static_cast<Candidate *>(fDarkHadronJetArray->At(ji));
+    vector<Candidate *> leaves;
+    CollectCandidateLeaves(dhJet, leaves);
+
+    for(Candidate *leaf : leaves)
+    {
+      auto it = ptrToGenIdx.find(leaf);
+      if(it != ptrToGenIdx.end())
+        genIdxToJetIdx[it->second] = ji;
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Step 3 – Ancestry BFS with memoisation.
+  //
+  // For each visible SM particle we climb the decay chain via M1/M2 until
+  // we encounter a dark-hadron GenParticle index (success) or exhaust all
+  // ancestors (no match → particle not in any DH jet).
+  //
+  // MEMOISATION: ancestryCache[genIdx] = jet index (or -1).
+  //   After any traversal we back-fill every node we visited with the found
+  //   result, so subsequent visible particles sharing ancestry benefit
+  //   immediately.
+  //
+  // WHY BFS UPWARD (rather than downward from DH particles):
+  //   A dark hadron may have more than two daughters at some stage of its
+  //   decay chain.  Delphes only stores D1 and D2 (the first two daughters),
+  //   so a downward walk would silently miss additional daughters.
+  //   Going upward from the visible particles is exhaustive by construction.
+  // ──────────────────────────────────────────────────────────────────────────
+  unordered_map<Int_t, Int_t> ancestryCache; // GenParticle idx → jet idx | -1
+  ancestryCache.reserve(static_cast<size_t>(nAll));
+
+  vector<vector<Candidate *>> visiblePerJet(static_cast<size_t>(nDHJets));
+
+  for(Int_t vi = 0; vi < nVisible; ++vi)
+  {
+    Candidate *visCand = static_cast<Candidate *>(fInputArray->At(vi));
+
+    // Locate this particle in the global GenParticle array
+    auto ptrIt = ptrToGenIdx.find(visCand);
+    if(ptrIt == ptrToGenIdx.end()) continue; // not a GenParticle – skip
+    const Int_t startIdx = ptrIt->second;
+
+    // ── BFS state ──
+    Int_t             matchedJet = -1;
+    bool              foundMatch = false;
+    vector<Int_t>     visitedNodes;
+    queue<Int_t>      bfsQ;
+    unordered_set<Int_t> inQueue;
+
+    visitedNodes.reserve(32);
+    bfsQ.push(startIdx);
+    inQueue.insert(startIdx);
+
+    while(!bfsQ.empty() && !foundMatch)
+    {
+      const Int_t idx = bfsQ.front();
+      bfsQ.pop();
+      visitedNodes.push_back(idx);
+
+      // ── Memoisation cache hit ──
+      {
+        auto cit = ancestryCache.find(idx);
+        if(cit != ancestryCache.end())
+        {
+          matchedJet = cit->second;
+          foundMatch = true;
+          break;
+        }
+      }
+
+      // ── Is this node one of the dark-hadron constituents? ──
+      {
+        auto dhit = genIdxToJetIdx.find(idx);
+        if(dhit != genIdxToJetIdx.end())
+        {
+          matchedJet = dhit->second;
+          foundMatch = true;
+          break;
+        }
+      }
+
+      // ── Stop at beam particles (Pythia8 indices 0 and 1) ──
+      if(idx <= 1) continue;
+
+      // ── Enqueue mothers ──
+      if(idx < nAll)
+      {
+        const Candidate *p =
+          static_cast<const Candidate *>(fAllParticleArray->At(idx));
+        const Int_t m1 = p->M1;
+        const Int_t m2 = p->M2;
+        // Guard: valid index, not a beam particle, not already queued
+        if(m1 > 1 && m1 < nAll && !inQueue.count(m1))
+        { bfsQ.push(m1); inQueue.insert(m1); }
+        if(m2 > 1 && m2 < nAll && m2 != m1 && !inQueue.count(m2))
+        { bfsQ.push(m2); inQueue.insert(m2); }
+      }
+    } // end BFS
+
+    // ── Back-fill memoisation cache for all nodes seen in this traversal ──
+    for(Int_t v : visitedNodes)
+      ancestryCache[v] = matchedJet;
+    // Drain nodes that were enqueued but not dequeued (break-on-match path)
+    while(!bfsQ.empty())
+    {
+      ancestryCache[bfsQ.front()] = matchedJet;
+      bfsQ.pop();
+    }
+
+    if(matchedJet >= 0)
+      visiblePerJet[static_cast<size_t>(matchedJet)].push_back(visCand);
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Step 4 – Assemble output PseudoJets.
+  //
+  // One output jet per DH jet, in the SAME ORDER as fDarkHadronJetArray.
+  // Each jet is built with fastjet::join() so that jet.constituents()
+  // works correctly for N-subjettiness, energy-correlation, soft-drop, etc.
+  //
+  // user_index of each constituent PseudoJet encodes its position in
+  // matchedVisArray so that Process() can retrieve the Candidate pointer.
+  // ──────────────────────────────────────────────────────────────────────────
+  Int_t globalConstIdx = 0;
+
+  for(Int_t ji = 0; ji < nDHJets; ++ji)
+  {
+    const vector<Candidate *> &parts = visiblePerJet[static_cast<size_t>(ji)];
+    vector<PseudoJet> pjConst;
+    pjConst.reserve(parts.size());
+
+    for(Candidate *vis : parts)
+    {
+      const TLorentzVector &p4 = vis->Momentum;
+      PseudoJet pj(p4.Px(), p4.Py(), p4.Pz(), p4.E());
+      pj.set_user_index(globalConstIdx++);
+      pjConst.push_back(pj);
+      matchedVisArray.Add(vis); // position == user_index
+    }
+
+    PseudoJet outJet;
+    if(!pjConst.empty())
+      outJet = fastjet::join(pjConst);
+    // else: default-constructed zero-momentum jet; still added to preserve ordering
+
+    outputJets.push_back(outJet);
+  }
+}
+
+//------------------------------------------------------------------------------
+
 void FastJetFinder::Process()
 {
   Candidate *candidate, *constituent;
@@ -334,7 +568,9 @@ void FastJetFinder::Process()
   Int_t charge;
   Double_t rho = 0.0;
   PseudoJet jet, area;
-  ClusterSequence *sequence;
+  ClusterSequence *sequence = nullptr;
+  const Bool_t isDHMode = (fJetAlgorithm == kDarkHadronVisibleMatch);
+  const TObjArray *effectiveInputArray = fInputArray; // overridden below for DH mode
   vector<PseudoJet> inputList, outputList, subjets;
   vector<PseudoJet>::iterator itInputList, itOutputList;
   vector<TEstimatorStruct>::iterator itEstimators;
@@ -348,6 +584,7 @@ void FastJetFinder::Process()
 
   inputList.clear();
 
+  if(!isDHMode){
   // loop over input objects
   fItInputArray->Reset();
   number = 0;
@@ -418,6 +655,14 @@ void FastJetFinder::Process()
   {
     outputList = sorted_by_pt(sequence->inclusive_jets(fJetPTMin));
   }
+  }
+  else {
+    // Build matched visible jets; jets are ordered by DH-jet input, NOT by pT.
+    fDHMatchedVisibleArray.Clear("nodelete");
+    BuildDarkHadronMatchedJets(outputList, fDHMatchedVisibleArray);
+    effectiveInputArray = &fDHMatchedVisibleArray;
+    // No ClusterSequenceArea; sequence stays nullptr.
+  }
 
   // loop over all jets and export them
   detaMax = 0.0;
@@ -452,7 +697,7 @@ void FastJetFinder::Process()
     for(itInputList = inputList.begin(); itInputList != inputList.end(); ++itInputList)
     {
       if(itInputList->user_index() < 0) continue;
-      constituent = static_cast<Candidate *>(fInputArray->At(itInputList->user_index()));
+      constituent = static_cast<Candidate *>(effectiveInputArray->At(itInputList->user_index()));
 
       deta = TMath::Abs(momentum.Eta() - constituent->Momentum.Eta());
       dphi = TMath::Abs(momentum.DeltaPhi(constituent->Momentum));
@@ -601,5 +846,5 @@ void FastJetFinder::Process()
 
     fOutputArray->Add(candidate);
   }
-  delete sequence;
+  if(sequence) delete sequence;
 }
