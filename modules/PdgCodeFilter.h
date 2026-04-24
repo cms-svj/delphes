@@ -54,6 +54,7 @@ private:
   Bool_t fRequireCharge; //!
   Int_t fCharge; //!
   Bool_t fRequireNotPileup; //!
+  Bool_t fFirstDark;
 
   std::vector<Int_t> fPdgCodes;
 
