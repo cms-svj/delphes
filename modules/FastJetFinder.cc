@@ -744,7 +744,7 @@ void FastJetFinder::Process()
     chargedEnergyFraction =0.;
 
     inputList.clear();
-    inputList = sequence->constituents(*itOutputList);
+    inputList = jet.constituents();
 
     for(itInputList = inputList.begin(); itInputList != inputList.end(); ++itInputList)
     {
