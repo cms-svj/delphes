@@ -336,6 +336,10 @@ void FastJetFinder::Finish()
   if(fAxesDef) delete fAxesDef;
   if(fMeasureDef) delete fMeasureDef;
   if(fValenciaPlugin) delete static_cast<JetDefinition::Plugin *>(fValenciaPlugin);
+
+   for(fastjet::ClusterSequence *cs : fDHClusterSequences)
+     delete cs;
+   fDHClusterSequences.clear();
 }
 
 //------------------------------------------------------------------------------
@@ -518,36 +522,76 @@ void FastJetFinder::BuildDarkHadronMatchedJets(
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // Step 4 – Assemble output PseudoJets.
+  // Step 4 – Assemble output PseudoJets, one per DH jet, in input order.
   //
-  // One output jet per DH jet, in the SAME ORDER as fDarkHadronJetArray.
-  // Each jet is built with fastjet::join() so that jet.constituents()
-  // works correctly for N-subjettiness, energy-correlation, soft-drop, etc.
+  // WHY exclusive_jets(1) instead of fastjet::join():
+  //   fastjet::join() creates a CompositePseudoJet (_cluster_hist_index = -1,
+  //   associated ClusterSequence = null).  Substructure tools such as
+  //   N-subjettiness (exclusive-kT axis mode), soft-drop, and trimming call
+  //   back through the ClusterSequence directly rather than going through the
+  //   CompositePseudoJet virtual interface, causing a null-pointer crash.
   //
-  // user_index of each constituent PseudoJet encodes its position in
-  // matchedVisArray so that Process() can retrieve the Candidate pointer.
+  //   By building a real ClusterSequence with exclusive_jets(1) we guarantee:
+  //     * _cluster_hist_index is valid (set by the ClusterSequence history)
+  //     * jet.associated_cluster_sequence() returns a live object
+  //     * jet.constituents() works through the standard history traversal
+  //     * all existing substructure code in Process() is unaffected
+  //
+  // WHY Cambridge/Aachen with R = 1e3:
+  //   C/A is the cheapest algorithm (O(N log N)) and with R = 1e3 every pair
+  //   of particles satisfies d_ij < d_iB, so they always merge pairwise before
+  //   hitting the beam.  exclusive_jets(1) then returns exactly one jet
+  //   containing all N particles, regardless of their rapidities.
+  //
+  // LIFETIME:
+  //   The ClusterSequence must outlive the PseudoJet objects that reference it.
+  //   Sequences are pushed onto fDHClusterSequences and deleted at the START of
+  //   the next Process() call (see the cleanup block below), by which point the
+  //   previous event's Candidates have been written to the output array.
   // ──────────────────────────────────────────────────────────────────────────
   Int_t globalConstIdx = 0;
 
+
+  static const fastjet::JetDefinition kDHSeqDef(
+    fastjet::cambridge_algorithm, 1.0e3);   // R huge -> all particles merge
+
   for(Int_t ji = 0; ji < nDHJets; ++ji)
   {
-    const vector<Candidate *> &parts = visiblePerJet[static_cast<size_t>(ji)];
-    vector<PseudoJet> pjConst;
+    const std::vector<Candidate *> &parts =
+      visiblePerJet[static_cast<size_t>(ji)];
+
+    std::vector<fastjet::PseudoJet> pjConst;
     pjConst.reserve(parts.size());
 
     for(Candidate *vis : parts)
     {
       const TLorentzVector &p4 = vis->Momentum;
-      PseudoJet pj(p4.Px(), p4.Py(), p4.Pz(), p4.E());
+      fastjet::PseudoJet pj(p4.Px(), p4.Py(), p4.Pz(), p4.E());
       pj.set_user_index(globalConstIdx++);
       pjConst.push_back(pj);
-      matchedVisArray.Add(vis); // position == user_index
+      matchedVisArray.Add(vis);   // position == user_index
     }
 
-    PseudoJet outJet;
+    fastjet::PseudoJet outJet;
+
     if(!pjConst.empty())
-      outJet = fastjet::join(pjConst);
-    // else: default-constructed zero-momentum jet; still added to preserve ordering
+    {
+      // Build a real ClusterSequence so that _cluster_hist_index is valid
+      // and all substructure tools (N-subjettiness, soft-drop, trimming, …)
+      // have a live ClusterSequence to call back through.
+      fastjet::ClusterSequence *cs =
+        new fastjet::ClusterSequence(pjConst, kDHSeqDef);
+
+      // exclusive_jets(1): force all constituents into exactly ONE jet.
+      // This is robust even when particles span very different rapidities.
+      std::vector<fastjet::PseudoJet> excl = cs->exclusive_jets(1);
+      outJet = excl[0];   // has valid _cluster_hist_index
+
+      fDHClusterSequences.push_back(cs);  // keep alive until next event
+    }
+    // else: zero-momentum default-constructed PseudoJet; ordering preserved.
+    // A zero-momentum entry will have pT = 0 and will be filtered out by
+    // JetPTMin > 0 in the card, or handled gracefully by analysis code.
 
     outputJets.push_back(outJet);
   }
@@ -657,11 +701,19 @@ void FastJetFinder::Process()
   }
   }
   else {
+      // Delete ClusterSequence objects from the PREVIOUS event.
+      // They must not be deleted earlier because the PseudoJets that reference
+      // them (and by extension the Candidate objects written to the output
+      // array) are only finalised after Process() returns to the framework.
+      for(fastjet::ClusterSequence *cs : fDHClusterSequences)
+        delete cs;
+      fDHClusterSequences.clear();
+
     // Build matched visible jets; jets are ordered by DH-jet input, NOT by pT.
     fDHMatchedVisibleArray.Clear("nodelete");
     BuildDarkHadronMatchedJets(outputList, fDHMatchedVisibleArray);
     effectiveInputArray = &fDHMatchedVisibleArray;
-    // No ClusterSequenceArea; sequence stays nullptr.
+    // sequence stays nullptr
   }
 
   // loop over all jets and export them

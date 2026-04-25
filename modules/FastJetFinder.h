@@ -190,6 +190,10 @@ private:
   /// stored in user_index order.  Owned by the factory (nodelete).
   TObjArray fDHMatchedVisibleArray;
 
+  /// These are heap-allocated per-event and deleted at the start of the
+  /// following event, after ROOT has written the previous event's jets.
+  std::vector<fastjet::ClusterSequence *> fDHClusterSequences;
+
   /// Core implementation: fills outputJets and matchedVisArray.
   void BuildDarkHadronMatchedJets(
     std::vector<fastjet::PseudoJet> &outputJets,
