@@ -743,6 +743,16 @@ void FastJetFinder::Process()
     neutralEnergyFraction =0.;
     chargedEnergyFraction =0.;
 
+    if(isDHMode and !jet.has_structure()){
+      // no visible constituents
+      // Emit a zero-momentum sentinel to keep outputArray[i] aligned with
+      // FastJetFinderDH/jets[i].  Analysis code should check jet.PT > 0
+      // (or jet.NCharged + jet.NNeutrals == 0) to identify these entries.
+      candidate->Momentum.SetPxPyPzE(0., 0., 0., 0.);
+      fOutputArray->Add(candidate);
+      continue;
+    }
+
     inputList.clear();
     inputList = jet.constituents();
 
