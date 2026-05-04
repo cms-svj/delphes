@@ -85,6 +85,7 @@ void PdgCodeFilter::Init()
   fCharge = GetInt("Charge", 1);
 
   fFirstDark = GetBool("FirstDark", false);
+  fStableDark = GetBool("StableDark", false);
 
   // import input array
   fInputArray = ImportArray(GetString("InputArray", "Delphes/allParticles"));
@@ -99,6 +100,21 @@ void PdgCodeFilter::Init()
   for(i = 0; i < size; ++i)
   {
     fPdgCodes.push_back(param[i].GetInt());
+  }
+
+  if(fStableDark){
+    ExRootConfParam param2;
+    Size_t j, size2;
+
+    param2 = GetParam("PdgDaughter");
+    size2 = param2.GetSize();
+
+    // read codes
+    fPdgDaughters.clear();
+    for(j = 0; j < size2; ++j)
+    {
+      fPdgDaughters.push_back(param2[j].GetInt());
+    }
   }
 
   // create output array
@@ -138,6 +154,12 @@ void PdgCodeFilter::Process()
       Int_t m2 = candidate->M2;
       if(m1 > 1 and find(fPdgCodes.begin(), fPdgCodes.end(), static_cast<Candidate *>(fInputArray->At(m1))->PID) != fPdgCodes.end()) continue;
       if(m2 > 1 and find(fPdgCodes.begin(), fPdgCodes.end(), static_cast<Candidate *>(fInputArray->At(m2))->PID) != fPdgCodes.end()) continue;
+    }
+
+    if(fStableDark){
+        Int_t d1 = candidate->D1;
+        //only keep particles with no daughter, or a daughter that is in the list of allowed daughters
+        if(d1!=-1 and find(fPdgDaughters.begin(), fPdgDaughters.end(), static_cast<Candidate *>(fInputArray->At(d1))->PID) == fPdgDaughters.end()) continue;
     }
 
     pass = kTRUE;
