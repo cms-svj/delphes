@@ -55,8 +55,10 @@ private:
   Int_t fCharge; //!
   Bool_t fRequireNotPileup; //!
   Bool_t fFirstDark;
+  Bool_t fStableDark;
 
   std::vector<Int_t> fPdgCodes;
+  std::vector<Int_t> fPdgDaughters;
 
   std::unique_ptr<TIterator> fItInputArray; //!
 
