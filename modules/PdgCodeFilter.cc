@@ -86,6 +86,7 @@ void PdgCodeFilter::Init()
 
   fFirstDark = GetBool("FirstDark", false);
   fStableDark = GetBool("StableDark", false);
+  fLastDark = GetBool("LastDark", false);
 
   // import input array
   fInputArray = ImportArray(GetString("InputArray", "Delphes/allParticles"));
@@ -160,6 +161,14 @@ void PdgCodeFilter::Process()
         Int_t d1 = candidate->D1;
         //only keep particles with no daughter, or a daughter that is in the list of allowed daughters
         if(d1!=-1 and find(fPdgDaughters.begin(), fPdgDaughters.end(), static_cast<Candidate *>(fInputArray->At(d1))->PID) == fPdgDaughters.end()) continue;
+    }
+
+    if(fLastDark){
+      Int_t d1 = candidate->D1;
+      Int_t d2 = candidate->D2;
+      //only keep partons whose daughters are not also partons
+      if(d1!=-1 and find(fPdgCodes.begin(), fPdgCodes.end(), static_cast<Candidate *>(fInputArray->At(d1))->PID) != fPdgCodes.end()) continue;
+      if(d2!=-1 and find(fPdgCodes.begin(), fPdgCodes.end(), static_cast<Candidate *>(fInputArray->At(d2))->PID) != fPdgCodes.end()) continue;
     }
 
     pass = kTRUE;

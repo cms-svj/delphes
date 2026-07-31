@@ -55,6 +55,7 @@ private:
   Bool_t fRequireNotPileup; //!
   Bool_t fFirstDark;
   Bool_t fStableDark;
+  Bool_t fLastDark;
 
   std::vector<Int_t> fPdgCodes;
   std::vector<Int_t> fPdgDaughters;
