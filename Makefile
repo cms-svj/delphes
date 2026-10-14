@@ -15,6 +15,9 @@ SrcSuf = cc
 PcmSuf = _rdict.pcm
 
 CXXFLAGS += $(ROOTCFLAGS) -D_FILE_OFFSET_BITS=64 -DDROP_CGAL -I. -Iexternal -Iexternal/tcl
+debug: CXXFLAGS += -g
+debug: LD_FLAGS += -g
+debug: all
 DELPHES_LIBS = $(shell $(RC) --libs) -lEG
 DISPLAY_LIBS = $(shell $(RC) --evelibs) -lGuiHtml
 
